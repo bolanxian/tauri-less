@@ -1,0 +1,9 @@
+{
+  "tasks": {
+    "build:init": "mkdir -p ./dist && mkdir -p ./src/deps",
+    "build:self-serve": "cd ./src/deps && zig build-exe -O ReleaseSmall ../self-serve.zig",
+    "build:tauri-less": "cd ./src/deps && zig build-exe -O ReleaseSafe ../tauri-less.zig",
+    "build": "deno task build:init && deno task build:self-serve && deno task build:tauri-less && cp ./src/deps/tauri-less.exe ./dist/tauri-less.exe",
+    "run": "./dist/tauri-less"
+  }
+}

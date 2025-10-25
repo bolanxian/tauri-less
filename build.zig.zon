@@ -1,0 +1,13 @@
+.{
+    .name = .tauri_less,
+    .version = "0.0.0",
+
+    .fingerprint = 0,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig.zon",
+        "src",
+        "deps",
+    },
+}
