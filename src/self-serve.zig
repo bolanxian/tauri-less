@@ -2,6 +2,7 @@ const std = @import("std");
 const fs = std.fs;
 const path = std.fs.path;
 const mem = std.mem;
+const heap = std.heap;
 const net = std.net;
 const http = std.http;
 const Server = @import("server.zig");
@@ -24,7 +25,7 @@ var typeMap: std.StringHashMap([]const u8) = undefined;
 var fileMap: HashMap = undefined;
 
 pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena_state: heap.ArenaAllocator = .init(heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
@@ -37,20 +38,24 @@ pub fn main() !void {
     fileMap = .init(arena);
     defer fileMap.deinit();
     {
+        const fileMapArena = fileMap.arena.allocator();
         const exe = try fs.openSelfExe(.{});
         defer exe.close();
-        var reader = try zip.Reader.init(arena, exe);
+        var reader: zip.Reader = try .init(arena, exe);
         defer reader.deinit(arena);
         while (reader.next()) |entry| {
-            const data = try entry.read(arena);
-            defer arena.free(data);
+            const data = entry.read(fileMapArena) catch |err| {
+                std.log.err("Invalid File \"{s}\": {}", .{ entry.name, err });
+                continue;
+            };
+            errdefer fileMapArena.free(data);
             const crc32 = std.hash.Crc32.hash(data);
             if (crc32 != entry.central.crc32)
                 std.log.warn("Invalid crc32: {s}", .{entry.name});
-            try fileMap.put(entry.name, data);
+            try fileMap.putOwned(entry.name, data);
         }
     }
-    var server = try Server.init(arena, "127.0.0.1", 0, handleRequest, handleError);
+    var server: Server = try .init(arena, "127.0.0.1", 0, handleRequest, handleError);
     defer server.deinit(arena);
     const url = try server.url(arena);
     defer arena.free(url);
@@ -72,14 +77,19 @@ const HashMap = struct {
             .inner = .init(arena),
         };
     }
-    pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
+    pub fn putOwned(self: *Self, key: []const u8, value: []const u8) !void {
         const arena = self.arena.allocator();
-        if (try self.inner.fetchPut(
-            try arena.dupe(u8, key),
-            try arena.dupe(u8, value),
-        )) |kv| {
+        const newKey = try arena.dupe(u8, key);
+        errdefer arena.free(newKey);
+        if (try self.inner.fetchPut(newKey, value)) |kv| {
             arena.free(kv.value);
         }
+    }
+    pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
+        const arena = self.arena.allocator();
+        const newValue = try arena.dupe(u8, value);
+        errdefer arena.free(newValue);
+        return self.putOwned(key, newValue);
     }
     pub fn get(self: *Self, key: []const u8) ?[]const u8 {
         return self.inner.get(key);
@@ -91,14 +101,28 @@ const HashMap = struct {
     }
     test {
         var map = Self.init(std.testing.allocator);
+        const arena = map.arena.allocator();
         defer map.deinit();
+
         try map.put("a", "d");
         try map.put("b", "e");
         try map.put("c", "f");
-        try std.testing.expectEqualSlices(u8, map.get("a").?, "d");
-        try std.testing.expectEqualSlices(u8, map.get("b").?, "e");
-        try std.testing.expectEqualSlices(u8, map.get("c").?, "f");
-        try std.testing.expect(map.get("d") == null);
+
+        try map.put("d", try arena.dupe(u8, "a"));
+        try map.put("e", try arena.dupe(u8, "b"));
+        try map.put("f", try arena.dupe(u8, "c"));
+
+        inline for ([_]struct { []const u8, []const u8 }{
+            .{ "a", "d" },
+            .{ "b", "e" },
+            .{ "c", "f" },
+            .{ "d", "a" },
+            .{ "e", "b" },
+            .{ "f", "c" },
+        }) |v| {
+            try std.testing.expectEqualSlices(u8, map.get(v.@"0").?, v.@"1");
+        }
+        try std.testing.expect(map.get("g") == null);
     }
 };
 test {

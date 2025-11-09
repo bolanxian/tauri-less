@@ -1,3 +1,4 @@
+const zip = @This();
 const std = @import("std");
 const ft = @import("file-time.zig");
 const mem = std.mem;
@@ -108,16 +109,34 @@ pub fn Array(comptime T: type) type {
 }
 
 pub inline fn pack(self: anytype) Array(@TypeOf(self)) {
-    return @bitCast(mem.nativeToLittle(Int(@TypeOf(self)), @bitCast(self)));
+    var data: Array(@TypeOf(self)) = undefined;
+    packTo(&data, self);
+    return data;
 }
 pub inline fn packTo(data: []u8, self: anytype) void {
-    data[0..sizeOf(@TypeOf(self))].* = pack(self);
+    const buffer: *Array(@TypeOf(self)) = data[0..sizeOf(@TypeOf(self))];
+    mem.writeInt(Int(@TypeOf(self)), buffer, @bitCast(self), .little);
 }
-pub inline fn unpack(comptime T: type, data: []const u8) !T {
-    const inst: T = @bitCast(mem.littleToNative(Int(T), @bitCast(data[0..sizeOf(T)].*)));
-    try if (inst.magic != T.MAGIC)
+pub inline fn check(self: anytype) error{InvalidMagicNumber}!@TypeOf(self) {
+    try if (self.magic != @TypeOf(self).MAGIC)
         error.InvalidMagicNumber;
-    return inst;
+    return self;
+}
+pub inline fn unpack(comptime T: type, data: []const u8) error{InvalidMagicNumber}!T {
+    const self: T = @bitCast(mem.readInt(Int(T), data[0..sizeOf(T)], .little));
+    return check(self);
+}
+test {
+    inline for (.{ LocalFileHeader, CentralDirectoryHeader, EndOfCentralDirectory } ** 256) |T| {
+        @setEvalBranchQuota(256 * 1024);
+        var buffer: Array(T) = undefined;
+        try std.posix.getrandom(&buffer);
+        mem.writeInt(u32, buffer[0..4], T.MAGIC, .little);
+        const unpacked = try unpack(T, &buffer);
+        const @"packed" = pack(unpacked);
+        std.debug.assert(unpacked == try unpack(T, &pack(unpacked)));
+        std.debug.assert(mem.eql(u8, &@"packed", &buffer));
+    }
 }
 
 pub const Writer = struct {
@@ -174,11 +193,7 @@ pub const Writer = struct {
     }
     pub fn write(self: *Self, name: []const u8, data: []const u8, date: Date) Error!void {
         const options = &self.options;
-        const crc32: u32 = do: {
-            var crc32: std.hash.Crc32 = .init();
-            crc32.update(data);
-            break :do crc32.final();
-        };
+        const crc32: u32 = std.hash.Crc32.hash(data);
         var header: LocalFileHeader = .{
             .version = options.version,
             .bit_flag = options.bit_flag,
@@ -212,78 +227,95 @@ pub const Writer = struct {
 pub const Reader = struct {
     const Self = @This();
     file: File,
-    header: []const u8,
-    offset: usize = 0,
+    header: Io.Reader,
+    i: u16,
+    entry_count: u16,
     pub fn init(arena: mem.Allocator, file: File) Error!Self {
         const eocd = do: {
-            const T = EndOfCentralDirectory;
-            try file.seekFromEnd(-sizeOf(T));
-            var eocd: Array(T) = undefined;
-            _ = try file.readAll(&eocd);
-            break :do try unpack(T, &eocd);
+            const Eocd = EndOfCentralDirectory;
+            var buffer: Array(Eocd) = undefined;
+            var reader = file.reader(&buffer);
+            const size = reader.getSize() catch return File.Reader.SeekError.Unexpected;
+            try reader.seekTo(size - sizeOf(Eocd));
+            break :do try check(try reader.interface.takeStruct(Eocd, .little));
         };
-        try file.seekTo(eocd.offset);
-        const header = try arena.alloc(u8, eocd.size);
+        var reader = file.reader(&.{});
+        try reader.seekTo(eocd.offset);
+        const header = try reader.interface.readAlloc(arena, eocd.size);
         errdefer arena.free(header);
-        _ = try file.readAll(header);
 
         return .{
             .file = file,
-            .header = header,
+            .header = .fixed(header),
+            .i = 0,
+            .entry_count = eocd.entry_count,
         };
     }
     pub fn next(self: *Self) ?Entry {
-        if (self.offset < self.header.len) {
-            const central = unpack(CentralDirectoryHeader, self.header[self.offset..]) catch return null;
-            self.offset += sizeOf(CentralDirectoryHeader);
-            const name = self.header[self.offset..][0..central.name_len];
-            const entry = Entry.init(self.file, central, name);
-            self.offset += central.name_len + central.extra_len + central.comment_len;
-            return entry;
+        return self.nextInner() catch return null;
+    }
+    fn nextInner(self: *Self) Error!?Entry {
+        if (self.i < self.entry_count) {
+            self.i += 1;
+            const Central = CentralDirectoryHeader;
+            const central = try check(try self.header.takeStruct(Central, .little));
+            const name = try self.header.take(central.name_len);
+            self.header.toss(central.extra_len + central.comment_len);
+            return .{
+                .file = self.file,
+                .name = name,
+                .central = central,
+            };
         }
         return null;
     }
     pub fn deinit(self: *const Self, arena: mem.Allocator) void {
-        arena.free(self.header);
+        arena.free(self.header.buffer);
     }
     pub const Entry = struct {
+        const Local = LocalFileHeader;
+
         file: File,
-        central: CentralDirectoryHeader,
         name: []const u8,
-        pub fn init(
-            file: File,
-            central: CentralDirectoryHeader,
-            name: []const u8,
-        ) Entry {
-            return .{
-                .file = file,
-                .central = central,
-                .name = name,
-            };
-        }
-        pub fn read(self: *const Entry, arena: mem.Allocator) Error![]u8 {
+        central: CentralDirectoryHeader,
+
+        pub fn readLocalHeader(self: *const Entry) Error!Local {
             const central = &self.central;
-            try self.file.seekTo(central.offset);
-            var buffer: Array(LocalFileHeader) = undefined;
-            _ = try self.file.readAll(&buffer);
-            const header = try unpack(LocalFileHeader, &buffer);
+            var buffer: Array(Local) = undefined;
+            var reader = self.file.reader(&buffer);
+            try reader.seekTo(central.offset);
+            const local = try check(try reader.interface.takeStruct(Local, .little));
+            return local;
+        }
+        pub fn checkHeader(self: *const Entry) Error!void {
+            const local = try self.readLocalHeader();
+            const central = &self.central;
             inline for (.{
                 "version", "bit_flag", "compress_method",
                 "date",    "crc32",    "compress_size",
-                "size",    "name_len",
+                "size",    "name_len", "extra_len",
             }) |name| {
-                const a = @field(header, name);
+                const a = @field(local, name);
                 const b = @field(central, name);
                 if (a != b) return error.InvalidZipHeader;
             }
+        }
+        pub fn readUnchecked(self: *const Entry, arena: mem.Allocator) Error![]u8 {
+            const central = &self.central;
             const data = try arena.alloc(u8, central.compress_size);
             errdefer arena.free(data);
-            try self.file.seekTo(central.offset + sizeOf(LocalFileHeader) + header.name_len + header.extra_len);
-            _ = try self.file.readAll(data);
+
+            var reader = self.file.reader(&.{});
+            try reader.seekTo(central.offset + sizeOf(LocalFileHeader) + central.name_len + central.extra_len);
+            _ = try reader.interface.readSliceAll(data);
             return data;
         }
+        pub fn read(self: *const Entry, arena: mem.Allocator) Error![]u8 {
+            try self.checkHeader();
+            return self.readUnchecked(arena);
+        }
     };
-    pub const Error = mem.Allocator.Error || File.ReadError || File.SeekError || error{
+    pub const Error = mem.Allocator.Error || File.Reader.SeekError || Io.Reader.Error || error{
         InvalidMagicNumber,
         InvalidZipHeader,
     };
